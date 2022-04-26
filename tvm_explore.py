@@ -1,75 +1,25 @@
-
-## Author Manoj Kumar
-
-from ast import arg
-from enum import auto
-from inspect import trace
-from numpy import dtype
+from PIL import Image
+import numpy as np
+import tvm.relay as relay
+import tvm
+from tvm.contrib import graph_executor
 import torch
 import torchvision
-import torchvision.transforms as transforms
-import os
 import time
-import argparse
 import pandas as pd
-from tqdm import tqdm
-import matplotlib.pyplot as plt
-import torch.nn as nn
-import torch.nn.functional as F
-import torch.optim as optim
-import numpy as np
-import sys
-import tvm
-from tvm import relay
-from tvm.contrib import graph_executor
-import logging
-#logging.getLogger('autotvm').setLevel(logging.DEBUG)
-#logging.getLogger('autotvm').addHandler(logging.StreamHandler(sys.stdout))
+from scipy.special import softmax
+import random
+import torchvision.transforms as transforms
+import glob
+import tqdm
+import argparse
 
-assert(torch.cuda.is_available())
-device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
-
-
-class Cifa10DataSet():
-    def __init__(self, testbatch, trainbatch=64) -> None:
-        self.width = 224
-        self.height = 224
-        self.outfeatures = 10
-
-        # Loads CIFAR10 dataset.
-        self.transform = transforms.Compose(
-            [transforms.ToTensor(),
-            transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))])  
-
-        self.my_preprocess2 = transforms.Compose(
-            [
-                transforms.Resize(self.height),
-                transforms.ToTensor(),
-                transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
-            ]
-        )
-
-        self.sample_to_take = 10000
-
-        if testbatch > 50:
-            self.sample_to_take = 2000
-
-
-        self.trainset = torchvision.datasets.CIFAR10(root='./data', train=True,
-                                                download=True, transform=self.my_preprocess2)
-        
-        #self.trainsubset = torch.utils.data.Subset(self.trainset, range(0, 10000))
-        self.trainloader = torch.utils.data.DataLoader(self.trainset, batch_size=trainbatch,
-                                                shuffle=True, num_workers=2)
-
-        self.testset = torchvision.datasets.CIFAR10(root='./data', train=False,
-                                            download=True, transform=self.my_preprocess2)
-        #self.testsubset = torch.utils.data.Subset(self.testset, range(0,self.sample_to_take))
-        self.testloader = torch.utils.data.DataLoader(self.testset, batch_size=testbatch,
-                                                shuffle=False, num_workers=2)
+import os
+os.environ["PATH"] = os.environ["PATH"]+":/usr/local/cuda/bin/"
+os.environ["TVM_HOME"] = "~/CodeBase/General/tvm"
 
 class AnimalClassification():
-    def __init__(self, testbatch, img_shape, trainbatch=16) -> None:
+    def __init__(self, testbatch, img_shape=224, trainbatch=16) -> None:
         self.width = img_shape
         self.height = img_shape
         self.outfeatures = 3
@@ -95,201 +45,84 @@ class AnimalClassification():
             ]
         )
 
-        self.traindata = torchvision.datasets.ImageFolder(root='Dataset/training', transform=self.my_preprocess2)
+        dt_training_path = os.path.join(CommonData().curdir_path, '..', 'Dataset', 'training')
+        self.traindata = CustomAnimalClassLoader(dt_training_path)
         self.trainloader = torch.utils.data.DataLoader(self.traindata, batch_size=trainbatch,
-                                                shuffle=True, num_workers=4)
+                                                shuffle=False, num_workers=10)
 
-        self.testdata = torchvision.datasets.ImageFolder(root='Dataset/validation', transform=self.my_preprocess2)
+        dt_validation_path = os.path.join(CommonData().curdir_path, '..', 'Dataset', 'validation')
+        self.testdata = CustomAnimalClassLoader(dt_validation_path)
         self.testloader = torch.utils.data.DataLoader(self.testdata, batch_size=testbatch,
-                                                shuffle=True, num_workers=4)
+                                                shuffle=False, num_workers=10)
 
+class CustomAnimalClassLoader(torch.utils.data.Dataset):
+    def __init__(self, img_dir, img_shape=224):
+        super().__init__()
+        self.img_dir = img_dir
 
-class MetaData():
-    def __init__(self, test_batch, model_name, tvm_enable, autotune_tvm, img_shape) -> None:
-        self.dataset = AnimalClassification(test_batch, img_shape)
+        self.images = []
+        self.labels = []
+        self.img_shape = img_shape
 
-        # Number of distinct number labels, [0..9]
-        self.NUM_CLASSES = 10
-        self.samples = 100000
-        self.seed = 10
-        self.width = self.dataset.width
-        self.height = self.dataset.height
-        self.tvm_enable = tvm_enable
-        self.autotune_tvm = autotune_tvm
-        self.out_classes = self.dataset.outfeatures
+        self.class_map = {0:'Cheetah', 1:'Hyena', 2:'Tiger'}
+        for i, cl in self.class_map.items():
+            each_path = os.path.join(self.img_dir, cl, '*')
+            te_img = glob.glob(each_path, recursive=False)
+            self.images.extend(te_img)
 
-        # Number of examples in each training batch (step)
-        self.TEST_BATCH = test_batch
-        self.epochs = 3
-        self.test_iteration = 1
-        self.use_cpu = False
+            le_img = list(np.ones(len(te_img)) * i)
+            self.labels.extend(le_img)
+            print(f"Found {len(te_img)} images in class {cl}")
+        
+        for i in range(len(self.images)):
+            if not self.class_map[self.labels[i]] in self.images[i]:
+                print(f"{i} : {self.labels[i]}  {self.class_map[self.labels[i]]}   {self.images[i]}")
+                raise "error"
+        
+        random.seed(100)
+        random.shuffle(self.images)
+        random.seed(100)
+        random.shuffle(self.labels)
 
-        # Number of training steps to run
-        self.TRAIN_STEPS = 1000
-        self.trainloader = self.dataset.trainloader
-        self.testloader = self.dataset.testloader
+        for i in range(len(self.images)):
+            if not self.class_map[self.labels[i]] in self.images[i]:
+                print(f"{i} : {self.labels[i]}  {self.class_map[self.labels[i]]}   {self.images[i]}")
+                raise "error"
 
+        assert(len(self.images)==len(self.labels))
+    
+    def __len__(self):
+        return len(self.images)
+    
+    def __getitem__(self, index):
+        my_preprocess2 = transforms.Compose(
+                    [
+                        transforms.Resize(self.img_shape),
+                        transforms.ToTensor(),
+                        transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+                    ]
+                )
+                
+        pil_img = Image.open(self.images[index])
+        img = my_preprocess2(pil_img)
+        lbl = torch.tensor(self.labels[index], dtype=torch.long)
+        filename = self.images[index]
+
+        return img, lbl, filename    
+
+class CommonData():
+    def __init__(self, batch=8, model_name='resnet50') -> None:
+        self.batch = batch
         self.model_name = model_name
-        self.model_path = f'saved_model/cifar_net_{self.model_name}.pt'
+        self.curdir_path = os.path.dirname(os.path.realpath(__file__))
+        self.device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+        self.model_save_path = os.path.join(self.curdir_path, 'saved_model')
+        if not os.path.exists(self.model_save_path):
+            os.mkdir(self.model_save_path)
 
-        if self.tvm_enable:
-            self.tvm_status = 'enabled'
-        else:
-            self.tvm_status = 'disabled'
-
-class ModelPool():
-    def __init__(self, params) -> None:
-        self.params = params 
-    
-    def transfer_learning(self, model):
-        for layer in model.parameters():
-            layer.requires_grad = False
-        
-        model.classifier[6].out_features = self.params.out_classes
-        return model.to(device)
-
-    def create_vgg16(self):
-        model = torchvision.models.vgg16(pretrained=True)
-        for layer in model.parameters():
-            layer.requires_grad = False
-        
-        model.classifier[6].out_features = self.params.out_classes
-        return model.to(device)
-
-    def create_resnet50_bk(self):
-        model = torchvision.models.resnet50(pretrained=True)
-        in_features = model.fc.in_features
-        for layer in model.parameters():
-            layer.requires_grad = False
-        
-        model.fc = nn.Sequential(
-            nn.Linear(in_features, 256),
-            nn.ReLU(),
-            nn.Linear(256, 128),
-            nn.ReLU(),
-            nn.Linear(128, 64),
-            nn.ReLU(),
-            nn.Linear(64, self.params.out_classes)
-        )
-        #print(model)
-
-        return model.to(device)
-    
-    def create_resnet50(self):
-        model = torchvision.models.resnet50(pretrained=True)
-        in_features = model.fc.in_features
-        for layer in model.parameters():
-            layer.requires_grad = False
-        
-        model.fc = nn.Linear(in_features=2048, out_features=self.params.out_classes, bias=True)
-        print(model)
-
-        return model.to(device)
-
-    def create_resnet101(self):        
-        model = torchvision.models.resnet101(pretrained=True)
-        for layer in model.parameters():
-            layer.requires_grad = False
-        
-        model.fc.out_features = self.params.out_classes
-        return model
-
-
-    def generate_model(self):
-        class Net(nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.conv1 = nn.Conv2d(3, 6, 5)
-                self.pool = nn.MaxPool2d(2, 2)
-                self.conv2 = nn.Conv2d(6, 16, 5)
-                self.fc1 = nn.Linear(16 * 5 * 5, 120)
-                self.fc2 = nn.Linear(120, 84)
-                self.fc3 = nn.Linear(84, self.params.out_classes)
-
-            def forward(self, x):
-                x = self.pool(F.relu(self.conv1(x)))
-                x = self.pool(F.relu(self.conv2(x)))
-                x = torch.flatten(x, 1)  # flatten all dimensions except batch
-                x = F.relu(self.fc1(x))
-                x = F.relu(self.fc2(x))
-                x = self.fc3(x)
-                return x
-        
-        model = Net().to(device)
-        return model
-
-class PlayGround():
-    def __init__(self, params:MetaData) -> None:
-        self.params = params
-    
-    def get_autotune_network(self, name, batch_size, layout="NHWC", dtype="float32"):
-        if layout == "NHWC":
-            image_shape = (self.params.width, self.params.height, 3)
-        elif layout == "NCHW":
-            image_shape = (3, self.params.width, self.params.height)
-        else:
-            raise ValueError("Invalid layout: " + layout)
-        
-        output_shape = (batch_size, 1000)
-        input_shape = (batch_size,) + image_shape
-        
-        if name.startswith("resnet-"):
-            n_layer = int(name.split("-")[1])
-            mod, params = relay.testing.resnet.get_workload(
-                num_layers=n_layer,
-                batch_size=batch_size,
-                layout=layout,
-                dtype=dtype,
-                image_shape=image_shape,
-            )
-        else:
-            raise ValueError("autotune availbale only for resnet")
-        
-        return mod, params, input_shape, output_shape
-        
-        
-
-    def train(self, model):
-        global model_name
-        criterion = nn.CrossEntropyLoss()
-        optimizer = optim.SGD(model.parameters(), lr=0.001, momentum=0.9)
-
-        for epoch in tqdm(range(self.params.epochs)):  # loop over the dataset multiple times
-            running_loss = 0.0
-            for i, data in enumerate(self.params.trainloader, 0):
-                # get the inputs; data is a list of [inputs, labels]
-                inputs, labels = data
-                inputs, labels = data[0].to(device), data[1].to(device)
-
-                # zero the parameter gradients
-                optimizer.zero_grad()
-
-                # forward + backward + optimize
-                outputs = model(inputs)
-                score, preds = torch.max(outputs, 1)
-                accuracy = (preds == labels).sum().item() / inputs.shape[0]
-
-                loss = criterion(outputs, labels)
-                loss.backward()
-                optimizer.step()
-
-                # print statistics
-                running_loss += loss.item() / inputs.shape[0]
-                if ((i % 20 == 0) and (i != 0)):    # print every 2000 mini-batches
-                    print(f'{epoch} loss: {running_loss} : Accuracy = {accuracy}')
-                    running_loss = 0.0
-                    
-                    
-        input_shape = [self.params.TEST_BATCH, 3, self.params.width, self.params.height]
-        input_data = torch.randn(input_shape).to(device)
-        scripted_model = torch.jit.trace(model, input_data)
-        #scripted_model = torch.jit.script(model)
-        scripted_model.save(self.params.model_path)
-        return scripted_model
-    
     def warmup(self, model):
-        random_gen_img = torch.rand(self.params.TEST_BATCH, 3, self.params.width, self.params.height)
-        random_gen_img =  random_gen_img.to(device)
+        random_gen_img = torch.rand(self.batch, 3, 224, 224)
+        random_gen_img =  random_gen_img.to(self.device)
         warmup_itr = 5
         for _ in range(warmup_itr):
             model(random_gen_img)
@@ -297,7 +130,7 @@ class PlayGround():
         return model
 
     def tvm_warmup(self, model):
-        random_gen_img = torch.rand(self.params.TEST_BATCH, 3, self.params.width, self.params.height)
+        random_gen_img = torch.rand(self.batch, 3, 224, 224)
         #random_gen_img =  random_gen_img.to(device)
         warmup_itr = 5
         for _ in range(warmup_itr):
@@ -305,179 +138,124 @@ class PlayGround():
             model.run()
 
         return model
-    
-    def inference(self, model):
-        inference_time = []
-        accuracy_list = []
-        confidence = []
-        results = pd.DataFrame()
-
-        for iteration in range(self.params.test_iteration):
-            accuracy_list.clear()
-            inference_time.clear()
-            confidence.clear()
-            
-            for i, data in tqdm(enumerate(self.params.testloader)):
-                input, labels = data 
-                print("shape = ", input.shape)
-                inputs, labels = data[0].to(device), data[1].to(device)
-                start = time.time()
-                out = model(inputs)
-                end = time.time()
-                confidence.append(torch.nn.functional.softmax(out, dim=1).cpu().detach().numpy().max(axis=1))
-                score, preds = torch.max(out, 1)
-                acc = (preds == labels).sum().item()/ inputs.shape[0]
-                accuracy_list.append(acc)
-                inference_time.append((end-start)/inputs.shape[0])
-            
-            results[str(iteration) + "_time"] = inference_time
-            results[str(iteration) + "_acc"] = accuracy_list
-            results[str(iteration) + "_conf"] = confidence
-
-            
-        dataframe_name = f'TVM_{self.params.tvm_status}_{self.params.model_name}_bch{str(self.params.TEST_BATCH)}.csv'
-
-        results.to_csv(dataframe_name)
-        print("Data is saved in ", dataframe_name)
-        self.get_stats(dataframe_name)
-    
-    def autotune(self, mod, params, target):
-        log_file = "%s-B%d-%s.json" % (self.params.model_name, self.params.TEST_BATCH, target.kind.name)
-        image_shape = (self.params.width, self.params.height, 3)
-        output_shape = (self.params.TEST_BATCH, 10)
-        input_shape = (self.params.TEST_BATCH,) + image_shape
-
-        tasks, task_weights = tvm.auto_scheduler.extract_tasks(mod["main"], params, target)
-        for idx, task in enumerate(tasks):
-            print("========== Task %d  (workload key: %s) ==========" % (idx, task.workload_key))
-            print(task.compute_dag)
-        
-        print("Begin tuning...")
-        measure_ctx = tvm.auto_scheduler.LocalRPCMeasureContext(repeat=1, min_repeat_ms=300, timeout=10)
-
-        tuner = tvm.auto_scheduler.TaskScheduler(tasks, task_weights)
-        tune_option = tvm.auto_scheduler.TuningOptions(
-            num_measure_trials=200,  # change this to 20000 to achieve the best performance
-            runner=measure_ctx.runner,
-            measure_callbacks=[tvm.auto_scheduler.RecordToFile(log_file)],
-        )
-
-        tuner.tune(tune_option)
-        print("Compile...")
-        with tvm.auto_scheduler.ApplyHistoryBest(log_file):
-            with tvm.transform.PassContext(opt_level=3, config={"relay.backend.use_auto_scheduler": True}):
-                lib = relay.build(mod, target=target, params=params)
-        
-        return lib
-
-    def evaluate(self, model):
-        print("#### Evaluation Started ####")
-        if self.params.tvm_enable:
-            model.eval()
-
-            input_name = "input1"
-            shape_list = [(input_name, (self.params.TEST_BATCH,3,self.params.height,self.params.width))]
-            md, model_params = relay.frontend.from_pytorch(model, shape_list)
-            if self.params.use_cpu:
-                print("DEVICE : LLVM")
-                target = tvm.target.Target("llvm", host="llvm")
-                dev = tvm.cpu(0)
-            else:
-                print("DEVICE : CUDA")
-                target = tvm.target.cuda(arch='sm_61')
-                dev = tvm.cuda(0)
-
-            #dev = tvm.device(str(target))
-            if self.params.autotune_tvm:
-                lib = self.autotune(md, model_params, target)
-            else:
-                with tvm.transform.PassContext(opt_level=3):
-                    lib = relay.build(md, target=target, params=model_params)
-            
-            model_graph = graph_executor.GraphModule(lib["default"](dev))
-
-            model_graph = self.tvm_warmup(model_graph)
-
-            inference_time = []
-            accuracy_list = []
-            confidence = []
-
-            for i, data in tqdm(enumerate(self.params.testloader)):
-                input, labels = data 
-                print("shape = ", input.shape)
-                if input.shape != (self.params.TEST_BATCH,3, self.params.height,self.params.width):
-                    print(f"Last batch of size {input.shape} ignored")
-                    break
-
-                dtype = "float32"
-                model_graph.set_input(input_name, tvm.nd.array(input.numpy().astype(dtype)))
-                start_t = time.time()
-                model_graph.run()
-                end_t = time.time()
-                # Get outputs
-                tvm_output = model_graph.get_output(0)
-                preds = np.argmax(tvm_output.numpy(), axis=1)
-                confidence.append(torch.nn.functional.softmax(torch.from_numpy(tvm_output.numpy()), dim=1).numpy().max(axis=1))
-                acc = (preds == labels.numpy()).sum().item()/ input.shape[0]
-                accuracy_list.append(acc)
-                inference_time.append((end_t - start_t)/input.shape[0])
-            
-            results = pd.DataFrame()
-            results["0_time"] = inference_time
-            results["0_acc"] = accuracy_list
-            results["Itr0_conf"] = confidence
-            dataframe_name = f'TVM_{self.params.tvm_status}_{self.params.model_name}_bch{str(self.params.TEST_BATCH)}.csv'
-            results.to_csv(dataframe_name)
-            print("Data is saved in ", dataframe_name)
-            self.get_stats(dataframe_name)
-
-        else:
-            model.eval()
-            model = self.warmup(model)
-            self.inference(model)
-
 
     def get_stats(self, csv_file):
         trace_d = pd.read_csv(csv_file)
         trace_d.drop(axis=1, inplace=True, index=0)
         time_columns = [col for col in trace_d.columns if 'time' in col]
         mean_time = trace_d[time_columns].mean().mean()
-        print(f"Inference took {mean_time * 1000}ms : accuracy mean {trace_d['0_acc'].mean()}")
+        print(f"Inference took {mean_time * 1000}ms")
 
+def run_pytorch_inference(common_obj:CommonData):
+    print("\n#### PYTORCH Inference start ####")
+    model = torchvision.models.resnet50(pretrained=True)
+    in_features = model.fc.in_features
+    for layer in model.parameters():
+        layer.requires_grad = False
+    
+    model.fc = torch.nn.Linear(in_features=2048, out_features=3, bias=True)
+    model = model.to(common_obj.device)
+    model.eval()
+    csv_name = f"TVM_disabled_{common_obj.model_name}_bch{common_obj.batch}.csv"
+    inference_time = []
+    predictions = []
+    filename = []
+    results = pd.DataFrame()
+
+    dls = AnimalClassification(common_obj.batch)
+    count = 0
+    for data, labels_, files in tqdm.tqdm(dls.testloader):
+        data = data.to(common_obj.device)
+        labels_ = labels_.to(common_obj.device)
+        if(data.shape[0] != common_obj.batch):
+            print("Ignored bath size ", data.shape)
+            break
+        count = count + 1
+        start = time.time()
+        res = model(data)
+        end = time.time()
+        inference_time.append((end-start)/data.shape[0])
+        scores = softmax(res.cpu().detach().numpy(), axis=-1)
+        predictions.append(scores)
+        filename.append(files)
+                    
+    results[str(count) + "_time"] = inference_time
+    results[str(count) + "_conf"] = predictions
+    results[str(count) + "_files"] = filename
+    results.to_csv(csv_name)
+    common_obj.get_stats(csv_name)
+    print("#### PYTORCH Inference ends ####")
+
+    return model    
+
+def run_tvm_inference(model, common_obj:CommonData):
+    print("\n#### TVM Inference start ####")
+    csv_name = f"TVM_enabled_{common_obj.model_name}_bch{common_obj.batch}.csv"
+    inference_time = []
+    predictions = []
+    filename = []
+    results = pd.DataFrame()
+
+    dls = AnimalClassification(common_obj.batch)
+    input_data = torch.randn((common_obj.batch,3,224,224))
+    scripted_model = torch.jit.trace(model.cpu(), input_data)
+
+    # Save scripted model
+    scripted_model.save('./saved_model/scripted_model_resnet50.pt')
+
+    target = tvm.target.cuda(arch='sm_61')
+    input_name = "data"
+    shape_dict = [(input_name, (common_obj.batch,3,224,224))]
+
+    mod, params = relay.frontend.from_pytorch(scripted_model, shape_dict)
+
+    with tvm.transform.PassContext(opt_level=3):
+        lib = relay.build(mod, target=target, params=params)
+
+    dev = tvm.device(str(target), 0)
+    module = graph_executor.GraphModule(lib["default"](dev))
+    count = 0
+
+    for data, labels_, files in tqdm.tqdm(dls.testloader):
+        if(data.shape[0] != common_obj.batch):
+            print("Ignored bath size ", data.shape)
+            break
+        count = count + 1
+        dtype = "float32"
+        module.set_input(input_name, data)
+        start = time.time()
+        module.run()
+        end = time.time()
+        output_shape = (data.shape[0], 3)
+        tvm_output = module.get_output(0, tvm.nd.empty(output_shape)).numpy()
+        inference_time.append((end-start)/data.shape[0])
+
+        scores = softmax(tvm_output, axis=-1)
+        predictions.append(scores)
+        filename.append(files)
+
+        
+    results[str(count) + "_time"] = inference_time
+    results[str(count) + "_conf"] = predictions
+    results[str(count) + "_files"] = filename
+    results.to_csv(csv_name)
+    common_obj.get_stats(csv_name)
+    print("#### TVM Inference start ####")   
+    return mod, module 
 
 if __name__ == "__main__":
-    # python tvm_explore.py --create-model resnet50 --infe-batch 64
-    # python tvm_explore.py --create-model resnet50 --infe-batch 64 --tvm
     parser = argparse.ArgumentParser()
-    parser.add_argument('--tvm', action='store_true',
-                        default=False, help="Set true to enable jit_compiler")
-    parser.add_argument('--infe-batch', default=1,
+    parser.add_argument('--batch', default=8,
                         help="Set the batch size used in inference", type=int)
-    parser.add_argument('--image-shape', default=224,
-                        help="Set image share for resize", type=int)
-    parser.add_argument('--only-train', action='store_true',
-                        default=False, help="Train to save model")
-    parser.add_argument('--create-model', default='resnet50',
-                        help='set which model to use for inference')
-    parser.add_argument('--autotune-tvm', action='store_true', default=False,
-                        help='set true to enable autotune')
+
     args = parser.parse_args()
 
-    metadata = MetaData(model_name=args.create_model, test_batch=args.infe_batch, tvm_enable=args.tvm, autotune_tvm=args.autotune_tvm, img_shape=args.image_shape)
-    modelpool = ModelPool(metadata)
+    obj = CommonData(args.batch)
 
-    model_fn = {'resnet50': modelpool.create_resnet50,
-                'resnet101': modelpool.create_resnet101,
-                'vgg16': modelpool.create_vgg16,
-                'ownmodel': modelpool.generate_model
-                }
+    pt_model = run_pytorch_inference(obj)
+    torch.save(pt_model, './saved_model/resnet50.pt')
 
-    print("Using Moldel ", metadata.model_name)    
-    ground = PlayGround(metadata)
+    mod, module = run_tvm_inference(pt_model, obj)
 
-    if args.only_train:
-        model = model_fn[args.create_model]()
-        ground.train(model)
-    else:
-        model = torch.jit.load(metadata.model_path)        
-        ground.evaluate(model)
+    from tvm_viz import visualize
+    visualize(mod['main'])  # convert to png using dot -Tpng tvm_graph.dot > tvm_tvm.png
