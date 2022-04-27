@@ -223,11 +223,12 @@ def run_tvm_inference(model, common_obj:CommonData):
         count = count + 1
         dtype = "float32"
         module.set_input(input_name, data)
+        output_shape = (data.shape[0], 3)
         start = time.time()
         module.run()
+        tvm_output = module.get_output(0)
         end = time.time()
-        output_shape = (data.shape[0], 3)
-        tvm_output = module.get_output(0, tvm.nd.empty(output_shape)).numpy()
+        tvm_output = tvm_output.numpy()
         inference_time.append((end-start)/data.shape[0])
 
         scores = softmax(tvm_output, axis=-1)
