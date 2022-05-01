@@ -121,6 +121,7 @@ class CommonData():
             os.mkdir(self.model_save_path)
 
     def warmup(self, model):
+        print("torch model warmup stage...")
         random_gen_img = torch.rand(self.batch, 3, 224, 224)
         random_gen_img =  random_gen_img.to(self.device)
         warmup_itr = 5
@@ -130,11 +131,12 @@ class CommonData():
         return model
 
     def tvm_warmup(self, model):
+        print("tvm model warmup stage...")
         random_gen_img = torch.rand(self.batch, 3, 224, 224)
         #random_gen_img =  random_gen_img.to(device)
         warmup_itr = 5
         for _ in range(warmup_itr):
-            model.set_input("input1", tvm.nd.array(random_gen_img.numpy()))
+            model.set_input("data", tvm.nd.array(random_gen_img.numpy()))
             model.run()
 
         return model
@@ -144,7 +146,7 @@ class CommonData():
         trace_d.drop(axis=1, inplace=True, index=0)
         time_columns = [col for col in trace_d.columns if 'time' in col]
         mean_time = trace_d[time_columns].mean().mean()
-        print(f"Inference took {mean_time * 1000}ms")
+        print(f"Inference took {mean_time}ms")
 
 def run_pytorch_inference(common_obj:CommonData):
     print("\n#### PYTORCH Inference start ####")
@@ -162,6 +164,9 @@ def run_pytorch_inference(common_obj:CommonData):
     filename = []
     results = pd.DataFrame()
 
+    #warmup stage
+    model = common_obj.warmup(model) 
+
     dls = AnimalClassification(common_obj.batch)
     count = 0
     for data, labels_, files in tqdm.tqdm(dls.testloader):
@@ -171,10 +176,17 @@ def run_pytorch_inference(common_obj:CommonData):
             print("Ignored bath size ", data.shape)
             break
         count = count + 1
-        start = time.time()
+
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
         res = model(data)
-        end = time.time()
-        inference_time.append((end-start)/data.shape[0])
+        end.record()
+
+        # Waits for everything to finish running
+        torch.cuda.synchronize()
+
+        inference_time.append((start.elapsed_time(end))/data.shape[0]) # adding time in millisecond
         scores = softmax(res.cpu().detach().numpy(), axis=-1)
         predictions.append(scores)
         filename.append(files)
@@ -201,7 +213,7 @@ def run_tvm_inference(model, common_obj:CommonData):
     scripted_model = torch.jit.trace(model.cpu(), input_data)
 
     # Save scripted model
-    scripted_model.save('./saved_model/scripted_model_resnet50.pt')
+    #scripted_model.save('./saved_model/scripted_model_resnet50.pt')
 
     target = tvm.target.cuda(arch='sm_61')
     input_name = "data"
@@ -244,6 +256,97 @@ def run_tvm_inference(model, common_obj:CommonData):
     print("#### TVM Inference start ####")   
     return mod, module 
 
+def tvm_benchmark(model, common_obj:CommonData):
+    print("\n#### TVM Benchmark start ####")
+    csv_name = f"TVM_enabled_{common_obj.model_name}_bch{common_obj.batch}.csv"
+    inference_time = []
+    predictions = []
+    filename = []
+    results = pd.DataFrame()
+
+    dls = AnimalClassification(common_obj.batch)
+    input_data = torch.randn((common_obj.batch,3,224,224))
+    scripted_model = torch.jit.trace(model.cpu(), input_data)
+
+    target = tvm.target.cuda(arch='sm_61')
+    input_name = "data"
+    shape_dict = [(input_name, (common_obj.batch,3,224,224))]
+
+    mod, params = relay.frontend.from_pytorch(scripted_model, shape_dict)
+
+    with tvm.transform.PassContext(opt_level=3):
+        lib = relay.build(mod, target=target, params=params)
+
+    dev = tvm.device(str(target), 0)
+    module = graph_executor.GraphModule(lib["default"](dev))
+    count = 0
+
+    module = common_obj.tvm_warmup(module)
+
+    for data, labels_, files in tqdm.tqdm(dls.testloader):
+        if(data.shape[0] != common_obj.batch):
+            print("Ignored bath size ", data.shape)
+            break
+        count = count + 1
+
+        data_tvm = tvm.nd.array(data.cpu().numpy().astype('float32'), tvm.cuda(0))
+        module.set_input("data", data_tvm)
+        tvm_results = module.benchmark(device=tvm.cuda(0), func_name="run", repeat=3, min_repeat_ms=500, number=3)
+
+        inference_time.append((tvm_results.mean/data.shape[0]) * 1000)
+        tvm_output = module.get_output(0).numpy()
+        scores = softmax(tvm_output, axis=-1)
+        predictions.append(scores)
+        filename.append(files)
+
+        #data_tvm = tvm.nd.array(data.cpu().numpy().astype('float32'), tvm.cuda(0))
+        #module.set_input("data", data_tvm)
+        #module.set_input(**{k:tvm.nd.array(v, tvm.cuda(0)) for k, v in params.items()})
+
+        #module.set_input(input_name, data)
+
+        # Evaluate
+        #print("Evaluate inference time cost...")
+        #https://tvm.apache.org/docs/reference/api/python/graph_executor.html#tvm.contrib.graph_executor.GraphModule.benchmark
+        #print(module.benchmark(device=tvm.cuda(0), func_name="run", repeat=3, min_repeat_ms=500, number=10))
+        #tvm_results = module.benchmark(device=tvm.cuda(0), func_name="run", repeat=5, min_repeat_ms=500, number=10)
+
+
+
+        # evaluate
+        #ftimer = module.module.time_evaluator("run", tvm.cuda(0), number=10, repeat=5)
+        #t = ftimer(data_tvm).results
+        #t = np.array(t) * 1000
+
+        #print('{} ms'.format(t.mean()))
+        #break
+
+        #prof_res = np.array(ftimer().results) * 1000  # multiply 1000 for converting to millisecond
+        #print("mean = ", np.mean(prof_res))
+        #print("std = ", np.std(prof_res))
+
+        """ output_shape = (data.shape[0], 3)
+        start = time.time()
+        module.run()
+        tvm_output = module.get_output(0)
+        end = time.time()
+        tvm_output = tvm_output.numpy()
+        inference_time.append((end-start)/data.shape[0])
+`
+        scores = softmax(tvm_output, axis=-1)
+        predictions.append(scores)
+        filename.append(files) 
+        break"""
+
+    results[str(count) + "_time"] = inference_time
+    results[str(count) + "_conf"] = predictions
+    results[str(count) + "_files"] = filename
+    results.to_csv(csv_name)
+    common_obj.get_stats(csv_name)
+
+    print("#### TVM Inference start ####")   
+    return mod, module 
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--batch', default=8,
@@ -254,9 +357,10 @@ if __name__ == "__main__":
     obj = CommonData(args.batch)
 
     pt_model = run_pytorch_inference(obj)
-    torch.save(pt_model, './saved_model/resnet50.pt')
+    torch.save(pt_model, os.path.join(obj.model_save_path, 'resnet50.pt'))
 
-    mod, module = run_tvm_inference(pt_model, obj)
+    #mod, module = run_tvm_inference(pt_model, obj)
+    mod, module = tvm_benchmark(pt_model, obj)
 
     from tvm_viz import visualize
     visualize(mod['main'])  # convert to png using dot -Tpng tvm_graph.dot > tvm_tvm.png
